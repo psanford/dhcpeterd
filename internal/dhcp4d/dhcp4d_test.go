@@ -69,7 +69,7 @@ func testHandler(t *testing.T) (_ *Handler, cleanup func()) {
 	serverIP := net.IPv4(192, 168, 42, 1)
 	startIP := net.IPv4(192, 168, 42, 2)
 
-	handler, err := NewHandler(iface, serverIP, startIP, net.IPMask{255, 255, 255, 0}, 230, 20*time.Minute, []string{"1.1.1.1"}, &noopSink{})
+	handler, err := NewHandler(iface, serverIP, startIP, net.IPMask{255, 255, 255, 0}, 230, 20*time.Minute, []string{"1.1.1.1"}, nil, WithConn(&noopSink{}))
 	if err != nil {
 		t.Fatal(err)
 	}

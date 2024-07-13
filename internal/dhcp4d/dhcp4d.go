@@ -44,6 +44,12 @@ type Lease struct {
 	LastACK          time.Time `json:"last_ack"`
 }
 
+type StaticLease struct {
+	Addr         net.IP
+	HardwareAddr string
+	Hostname     string
+}
+
 func (l *Lease) Expired(at time.Time) bool {
 	return !l.Expiry.IsZero() && at.After(l.Expiry)
 }
@@ -63,6 +69,9 @@ type Handler struct {
 
 	timeNow func() time.Time
 
+	staticLeases    map[string]StaticLease
+	reservedOffsets map[int]struct{}
+
 	// Leases is called whenever a new lease is handed out
 	Leases func([]*Lease, *Lease)
 
@@ -71,8 +80,15 @@ type Handler struct {
 	leasesIP map[int]*Lease
 }
 
-func NewHandler(iface *net.Interface, serverIP, startIP net.IP, netMask net.IPMask, leaseRange int, leasePeriod time.Duration, dnsServers []string, conn net.PacketConn) (*Handler, error) {
+func NewHandler(iface *net.Interface, serverIP, startIP net.IP, netMask net.IPMask, leaseRange int, leasePeriod time.Duration, dnsServers []string, staticLeases []StaticLease, opts ...Option) (*Handler, error) {
 	var err error
+
+	var options options
+	for _, opt := range opts {
+		opt.set(&options)
+	}
+
+	conn := options.conn
 	if conn == nil {
 		conn, err = packet.Listen(iface, packet.Raw, syscall.ETH_P_ALL, nil)
 		if err != nil {
@@ -89,18 +105,27 @@ func NewHandler(iface *net.Interface, serverIP, startIP net.IP, netMask net.IPMa
 		dnsServerIPs = append(dnsServerIPs, dnsIP...)
 	}
 
-	start := make(net.IP, len(serverIP))
-	copy(start, serverIP)
-	start[len(start)-1] += 1
+	reservedOffsets := make(map[int]struct{})
+
+	staticLeaseMap := make(map[string]StaticLease)
+	for _, sl := range staticLeases {
+		staticLeaseMap[strings.ToLower(sl.HardwareAddr)] = sl
+
+		i := dhcp4.IPRange(startIP, sl.Addr)
+		reservedOffsets[i] = struct{}{}
+	}
+
 	return &Handler{
-		rawConn:     conn,
-		iface:       iface,
-		leasesHW:    make(map[string]int),
-		leasesIP:    make(map[int]*Lease),
-		serverIP:    serverIP,
-		start:       start,
-		leaseRange:  leaseRange,
-		LeasePeriod: leasePeriod,
+		rawConn:         conn,
+		iface:           iface,
+		leasesHW:        make(map[string]int),
+		leasesIP:        make(map[int]*Lease),
+		staticLeases:    staticLeaseMap,
+		serverIP:        serverIP,
+		start:           startIP,
+		leaseRange:      leaseRange,
+		LeasePeriod:     leasePeriod,
+		reservedOffsets: reservedOffsets,
 		options: dhcp4.Options{
 			dhcp4.OptionSubnetMask:       netMask,
 			dhcp4.OptionRouter:           []byte(serverIP),
@@ -162,15 +187,24 @@ func (h *Handler) findLease() int {
 	h.leasesMu.Lock()
 	defer h.leasesMu.Unlock()
 	now := h.timeNow()
+
 	if len(h.leasesIP) < h.leaseRange {
 		// TODO: hash the hwaddr like dnsmasq
 		i := rand.Intn(h.leaseRange)
+
+		if _, reserved := h.reservedOffsets[i]; reserved {
+		}
+
 		if l, ok := h.leasesIP[i]; !ok || l.Expired(now) {
-			return i
+			if _, reserved := h.reservedOffsets[i]; !reserved {
+				return i
+			}
 		}
 		for i := 0; i < h.leaseRange; i++ {
 			if l, ok := h.leasesIP[i]; !ok || l.Expired(now) {
-				return i
+				if _, reserved := h.reservedOffsets[i]; !reserved {
+					return i
+				}
 			}
 		}
 	}
@@ -304,8 +338,13 @@ func (h *Handler) serveDHCP(p dhcp4.Packet, msgType dhcp4.MessageType, options d
 	case dhcp4.Discover:
 		free := -1
 
+		// offer static lease if configured
+		if sl, found := h.staticLeases[strings.ToLower(hwAddr)]; found {
+			free = h.canLease(sl.Addr, hwAddr)
+		}
+
 		// try to offer the requested IP, if any and available
-		if !reqIP.To4().Equal(net.IPv4zero) {
+		if free < 0 && !reqIP.To4().Equal(net.IPv4zero) {
 			free = h.canLease(reqIP, hwAddr)
 			// log.Printf("canLease(%v, %s) = %d", reqIP, hwAddr, free)
 		}
