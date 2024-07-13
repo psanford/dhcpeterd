@@ -28,8 +28,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/rtr7/router7/internal/netconfig"
-
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/krolaw/dhcp4"
@@ -73,24 +71,24 @@ type Handler struct {
 	leasesIP map[int]*Lease
 }
 
-func NewHandler(dir string, iface *net.Interface, ifaceName string, conn net.PacketConn) (*Handler, error) {
-	serverIP, err := netconfig.LinkAddress(dir, ifaceName)
-	if err != nil {
-		return nil, err
-	}
-	if iface == nil {
-		iface, err = net.InterfaceByName(ifaceName)
-		if err != nil {
-			return nil, err
-		}
-	}
+func NewHandler(iface *net.Interface, serverIP, startIP net.IP, netMask net.IPMask, leaseRange int, leasePeriod time.Duration, dnsServers []string, conn net.PacketConn) (*Handler, error) {
+	var err error
 	if conn == nil {
 		conn, err = packet.Listen(iface, packet.Raw, syscall.ETH_P_ALL, nil)
 		if err != nil {
 			return nil, err
 		}
 	}
-	serverIP = serverIP.To4()
+
+	var dnsServerIPs []byte
+	for _, s := range dnsServers {
+		dnsIP := net.ParseIP(s)
+		if dnsIP == nil {
+			return nil, fmt.Errorf("parse dns ip error invalid: %s", s)
+		}
+		dnsServerIPs = append(dnsServerIPs, dnsIP...)
+	}
+
 	start := make(net.IP, len(serverIP))
 	copy(start, serverIP)
 	start[len(start)-1] += 1
@@ -101,14 +99,12 @@ func NewHandler(dir string, iface *net.Interface, ifaceName string, conn net.Pac
 		leasesIP:    make(map[int]*Lease),
 		serverIP:    serverIP,
 		start:       start,
-		leaseRange:  230,
+		leaseRange:  leaseRange,
 		LeasePeriod: leasePeriod,
 		options: dhcp4.Options{
-			dhcp4.OptionSubnetMask:       []byte{255, 255, 255, 0},
+			dhcp4.OptionSubnetMask:       netMask,
 			dhcp4.OptionRouter:           []byte(serverIP),
-			dhcp4.OptionDomainNameServer: []byte(serverIP),
-			dhcp4.OptionDomainName:       []byte("lan"),
-			dhcp4.OptionDomainSearch:     []byte{0x03, 'l', 'a', 'n', 0x00},
+			dhcp4.OptionDomainNameServer: dnsServerIPs,
 		},
 		timeNow: time.Now,
 	}, nil

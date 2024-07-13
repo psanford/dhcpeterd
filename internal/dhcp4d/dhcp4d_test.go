@@ -16,10 +16,7 @@ package dhcp4d
 
 import (
 	"encoding/binary"
-	"io/ioutil"
 	"net"
-	"os"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -54,22 +51,6 @@ func decline(addr net.IP, hwaddr net.HardwareAddr, opts ...dhcp4.Option) dhcp4.P
 	return newPacket(dhcp4.Decline, addr, hwaddr, opts)
 }
 
-const goldenInterfaces = `
-{
-  "interfaces":[
-    {
-      "hardware_addr": "02:73:53:00:ca:fe",
-      "name": "uplink0"
-    },
-    {
-      "hardware_addr": "02:73:53:00:b0:0c",
-      "name": "lan0",
-      "addr": "192.168.42.1/24"
-    }
-  ]
-}
-`
-
 type noopSink struct{}
 
 func (*noopSink) LocalAddr() net.Addr                                { return nil }
@@ -81,25 +62,18 @@ func (*noopSink) SetWriteDeadline(t time.Time) error                 { return ni
 func (*noopSink) ReadFrom(buf []byte) (int, net.Addr, error)         { return 0, nil, nil }
 
 func testHandler(t *testing.T) (_ *Handler, cleanup func()) {
-	tmpdir, err := ioutil.TempDir("", "dhcp4dtest")
+
+	iface := &net.Interface{
+		HardwareAddr: net.HardwareAddr([]byte{0x11, 0x22, 0x33, 0x44, 0x55, 0x66}),
+	}
+	serverIP := net.IPv4(192, 168, 42, 1)
+	startIP := net.IPv4(192, 168, 42, 2)
+
+	handler, err := NewHandler(iface, serverIP, startIP, net.IPMask{255, 255, 255, 0}, 230, 20*time.Minute, []string{"1.1.1.1"}, &noopSink{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := ioutil.WriteFile(filepath.Join(tmpdir, "interfaces.json"), []byte(goldenInterfaces), 0644); err != nil {
-		t.Fatal(err)
-	}
-	handler, err := NewHandler(
-		tmpdir,
-		&net.Interface{
-			HardwareAddr: net.HardwareAddr([]byte{0x11, 0x22, 0x33, 0x44, 0x55, 0x66}),
-		},
-		"lan0",
-		&noopSink{},
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return handler, func() { os.RemoveAll(tmpdir) }
+	return handler, func() {}
 }
 
 func TestLease(t *testing.T) {
