@@ -19,7 +19,7 @@ import (
 	"bytes"
 	"encoding/hex"
 	"fmt"
-	"log"
+	"log/slog"
 	"math/rand"
 	"net"
 	"sort"
@@ -80,7 +80,7 @@ type Handler struct {
 	leasesIP map[int]*Lease
 }
 
-func NewHandler(iface *net.Interface, serverIP, startIP net.IP, netMask net.IPMask, leaseRange int, leasePeriod time.Duration, dnsServers []string, staticLeases []StaticLease, opts ...Option) (*Handler, error) {
+func NewHandler(iface *net.Interface, serverIP, startIP net.IP, netMask net.IP, leaseRange int, leasePeriod time.Duration, dnsServers []string, staticLeases []StaticLease, opts ...Option) (*Handler, error) {
 	var err error
 
 	var options options
@@ -96,13 +96,17 @@ func NewHandler(iface *net.Interface, serverIP, startIP net.IP, netMask net.IPMa
 		}
 	}
 
+	serverIP = serverIP.To4()
+	netMask = netMask.To4()
+	startIP = startIP.To4()
+
 	var dnsServerIPs []byte
 	for _, s := range dnsServers {
 		dnsIP := net.ParseIP(s)
 		if dnsIP == nil {
 			return nil, fmt.Errorf("parse dns ip error invalid: %s", s)
 		}
-		dnsServerIPs = append(dnsServerIPs, dnsIP...)
+		dnsServerIPs = append(dnsServerIPs, dnsIP.To4()...)
 	}
 
 	reservedOffsets := make(map[int]struct{})
@@ -115,7 +119,9 @@ func NewHandler(iface *net.Interface, serverIP, startIP net.IP, netMask net.IPMa
 		reservedOffsets[i] = struct{}{}
 	}
 
-	return &Handler{
+	slog.Info("new handler", "serverIP", serverIP, "netMask", netMask)
+
+	h := Handler{
 		rawConn:         conn,
 		iface:           iface,
 		leasesHW:        make(map[string]int),
@@ -127,12 +133,19 @@ func NewHandler(iface *net.Interface, serverIP, startIP net.IP, netMask net.IPMa
 		LeasePeriod:     leasePeriod,
 		reservedOffsets: reservedOffsets,
 		options: dhcp4.Options{
-			dhcp4.OptionSubnetMask:       netMask,
+			// dhcp4.OptionSubnetMask: []byte{255, 255, 255, 0},
+			// XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+			dhcp4.OptionSubnetMask:       []byte(netMask),
 			dhcp4.OptionRouter:           []byte(serverIP),
 			dhcp4.OptionDomainNameServer: dnsServerIPs,
+			dhcp4.OptionServerIdentifier: []byte(serverIP),
 		},
 		timeNow: time.Now,
-	}, nil
+	}
+
+	slog.Info("new handler", "h", h)
+
+	return &h, nil
 }
 
 // Apple recommends a DHCP lease time of 1 hour in
@@ -249,8 +262,10 @@ func (h *Handler) canLease(reqIP net.IP, hwaddr string) int {
 
 // ServeDHCP is always called from the same goroutine, so no locking is required.
 func (h *Handler) ServeDHCP(p dhcp4.Packet, msgType dhcp4.MessageType, options dhcp4.Options) dhcp4.Packet {
+	slog.Info("got dhcp packet", "iface", h.iface.Name, "type", msgType)
 	reply := h.serveDHCP(p, msgType, options)
 	if reply == nil {
+		slog.Info("no reply unsupported request", "iface", h.iface.Name, "type", msgType)
 		return nil // unsupported request
 	}
 	buf := gopacket.NewSerializeBuffer()
@@ -290,7 +305,7 @@ func (h *Handler) ServeDHCP(p dhcp4.Packet, msgType dhcp4.MessageType, options d
 		gopacket.Payload(reply))
 
 	if _, err := h.rawConn.WriteTo(buf.Bytes(), &packet.Addr{HardwareAddr: destMAC}); err != nil {
-		log.Printf("WriteTo: %v", err)
+		slog.Error("WriteTo err", "err", err)
 	}
 
 	return nil
@@ -361,9 +376,11 @@ func (h *Handler) serveDHCP(p dhcp4.Packet, msgType dhcp4.MessageType, options d
 		}
 
 		if free == -1 {
-			log.Printf("Cannot reply with DHCPOFFER: no more leases available")
+			slog.Error("cannot reply with DHCPOFFER: no more leases available")
 			return nil // no free leases
 		}
+
+		slog.Info("dhcp discover", "hw", hwAddr, "name", options[dhcp4.OptionHostName], "ip", dhcp4.IPAdd(h.start, free))
 
 		return dhcp4.ReplyPacket(p,
 			dhcp4.Offer,
@@ -413,6 +430,9 @@ func (h *Handler) serveDHCP(p dhcp4.Packet, msgType dhcp4.MessageType, options d
 		h.leasesIP[leaseNum] = lease
 		h.leasesHW[lease.HardwareAddr] = leaseNum
 		h.callLeasesLocked(lease)
+
+		slog.Info("dhcp reply", "hw", hwAddr, "name", options[dhcp4.OptionHostName], "ip", reqIP)
+
 		return dhcp4.ReplyPacket(
 			p,
 			dhcp4.ACK,
@@ -422,7 +442,7 @@ func (h *Handler) serveDHCP(p dhcp4.Packet, msgType dhcp4.MessageType, options d
 			h.options.SelectOrderOrAll(options[dhcp4.OptionParameterRequestList]))
 	case dhcp4.Decline:
 		if h.expireLease(hwAddr) {
-			log.Printf("Expired leases for %v upon DHCPDECLINE", hwAddr)
+			slog.Info("expired lease DHCPDECLINE", "hw", hwAddr)
 		}
 		// Decline does not expect an ACK response.
 		return nil
